@@ -348,3 +348,59 @@ class BaseSerializer(base.SerializerABC):
 
 class Serializer(with_metaclass(SerializerMeta, BaseSerializer)):
     __doc__ = BaseSerializer.__doc__
+
+
+class NamedSerializer(Serializer):
+    root_name = None
+    root_name_many = None
+
+    def __init__(self, *args, **kwargs):
+        root_name = kwargs.pop('root_name', None)
+        if root_name:
+            self.root_name = root_name
+
+        root_name_many = kwargs.pop('root_name_many', None)
+        if root_name_many:
+            self.root_name_many = root_name_many
+        elif not self.root_name_many and self.root_name:
+            self.root_name_many = self.root_name + 's'
+
+        super(NamedSerializer, self).__init__(*args, **kwargs)
+
+    def process_data(self, data):
+        print('Post Prcessing Data')
+        if self.root_name_many and self.many:
+            return {self.root_name_many: data}
+
+        if self.root_name:
+            return {self.root_name: data}
+
+        # Default to returning unrooted serializations if there is no
+        # root_name(s) set
+        return data
+
+
+class SideloadSerializer(NamedSerializer):
+    parent = None
+    side = {}   # Only used on ultimate parent
+
+    def __init__(self, *args, **kwargs):
+        self.parent  = kwargs.pop('parent', None)
+        super(SideloadSerializer, self).__init__(*args, **kwargs)
+
+    def process_data(self, data):
+        data = super(SideloadSerializer, self).process_data(data)
+        data = self.data_sideload(data, sideload=True)
+        return data
+    
+    def data_sideload(self, data=None, only=None, sideload=False):
+        if data is None:
+            data = self.data
+        if sideload:
+            for field in self.side:
+                if only is None or field in only:
+                    # Turn dictionary into list, ditionary is only there so
+                    # that the sideloaded fields behave like a set
+                    d = list(self.side[field].values())
+                    data.update({field:d})
+        return data

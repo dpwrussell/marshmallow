@@ -15,6 +15,7 @@ from marshmallow.base import FieldABC, SerializerABC
 from marshmallow.compat import (text_type, OrderedDict, iteritems, total_seconds,
                                 basestring)
 from marshmallow.exceptions import MarshallingError
+import marshmallow
 
 __all__ = [
     'validated',
@@ -714,3 +715,130 @@ class Select(Raw):
         return value
 
 Enum = Select
+
+
+class SideloadField(Raw):
+    def __init__(self, sideloaded_serializer, exclude=None, only=None, allow_null=False,
+                many=False, root_name_many=None, **kwargs):
+        self.sideloaded_serializer = sideloaded_serializer
+        self.allow_null = allow_null
+        self.only = only
+        self.exclude = exclude or ()
+        self.many = many
+        self.root_name_many = root_name_many
+        self.__serializer = None
+        self.__updated_fields = False  # ensures serializer fields are updated
+                                       # only once
+
+        super(SideloadField, self).__init__(**kwargs)
+
+    @property
+    def serializer(self):
+        """The sideloaded Serializer object."""
+
+        # TODO This check should not be here? The way parent is set on
+        # fields makes it difficult to check at the time the field is created
+        # because the parent is only set on the field, after it has been
+        # constructed
+        if not isinstance(self.parent, marshmallow.SideloadSerializer):
+            raise Exception("Sideloaded fields must have a Sideloaded" \
+                                    "parent serializer, not {0}.")
+
+        # Cache the serializer instance
+        if not self.__serializer:
+            if isinstance(self.sideloaded_serializer, SerializerABC):
+                self.__serializer = self.sideloaded_serializer
+            elif isinstance(self.sideloaded_serializer, type) and \
+                    issubclass(self.sideloaded_serializer, SerializerABC):
+                # Find ultimate parent
+                parent = self.parent
+                while hasattr(parent, 'parent') and parent.parent is not None:
+                    parent = parent.parent
+                if issubclass(self.sideloaded_serializer, marshmallow.SideloadSerializer):
+                    self.__serializer = self.sideloaded_serializer(None, many=self.many, parent=parent, root_name_many=self.root_name_many)
+                elif issubclass(self.sideloaded_serializer, marshmallow.NamedSerializer):
+                    self.__serializer = self.sideloaded_serializer(None, many=self.many, root_name_many=self.root_name_many)
+                else:
+                    self.__serializer = self.sideloaded_serializer(None, many=self.many)
+            else:
+                raise ValueError("Sideloaded fields must be passed a Serializer, not {0}."
+                                .format(self.sideloaded_serializer.__class__))
+        return self.__serializer
+
+    def __get_fields_to_marshal(self, all_fields):
+        '''Filter all_fields based on self.only and self.exclude.'''
+        # Default 'only' to all the sideloaded fields
+        ret = OrderedDict()
+        if all_fields is None:
+            return ret
+        elif isinstance(self.only, basestring):
+            ret[self.only] = all_fields[self.only]
+            return ret
+        else:
+            only = set(all_fields) if self.only is None else set(self.only)
+        if self.exclude and self.only:
+            # Make sure that only takes precedence
+            exclude = set(self.exclude) - only
+        else:
+            exclude = set([]) if self.exclude is None else set(self.exclude)
+        filtered = ((k, v) for k, v in all_fields.items()
+                    if k in only and k not in exclude)
+        return OrderedDict(filtered)
+
+    def output(self, key, obj):
+        # print('SS Output: ', id(self))
+        sideloaded_obj = self.get_value(key, obj)
+        if self.allow_null and sideloaded_obj is None:
+            return None
+        self.serializer.many = self.many
+        self.serializer.obj = sideloaded_obj
+
+        # Serialize the sideloaded part and save on root
+        if not self.__updated_fields:
+            self.__updated_fields = True
+            self.serializer._update_fields(sideloaded_obj)
+
+        fields = self.__get_fields_to_marshal(self.serializer.fields)
+        ret = self.serializer.marshal(sideloaded_obj, fields, many=self.many)
+        # As we are not using data, process_data is also not used, thus we
+        # must root the sideloaded results manually
+
+        # Find ultimate parent (TODO doesn't really need while as a serializers
+        # parent will always be the ultime parent or None if it is the ultimate
+        # parent)
+        parent = self.parent
+        while hasattr(parent, 'parent') and parent.parent is not None:
+            parent = parent.parent
+
+        # {'name': {id: data} }
+        if self.serializer.root_name_many:
+            side_root = parent.side.setdefault(self.serializer.root_name_many,
+                                               {})
+            if self.many:
+                for r in ret:
+                    side_root[r['id']]= r
+            else:
+                # Sideload like it was many anyway
+                side_root[ret['id']]= ret
+
+        # # Parent should get any errors stored after marshalling
+        # if self.serializer.errors:
+        #     self.parent.errors[key] = self.serializer.errors
+        # if isinstance(self.only, basestring):  # self.only is a field name
+        #     if self.many:
+        #         return flatten(ret, key=self.only)
+        #     else:
+        #         return ret[self.only]
+
+        # TODO Shouldn't be hardcoded to id
+        value = None
+        if self.many:
+            value = []
+            for item in sideloaded_obj:
+                value.append(self.get_value('id', item))
+        else:
+            value = self.get_value('id', sideloaded_obj)
+
+        if value is None:
+            return self.default
+        return self.format(value)
